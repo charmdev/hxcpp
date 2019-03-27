@@ -50,6 +50,7 @@ DEFFUNC_2(value,alloc_wstring_len,const wchar_t *,int)
 // Array access - generic
 DEFFUNC_1(value,alloc_array,int)
 DEFFUNC_1(int,val_array_size,value)
+DEFFUNC_1(short *,val_array_short,value)
 DEFFUNC_2(void,val_array_set_size,value,int)
 DEFFUNC_2(value,val_array_i,value,int)
 DEFFUNC_3(void,val_array_set_i,value,int,value)

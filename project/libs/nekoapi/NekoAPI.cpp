@@ -322,6 +322,10 @@ int * api_val_array_int(value  arg1)
 	return 0;
 }
 
+short * val_array_short(value  arg1)
+{
+	return 0;
+}
 
 double * api_val_array_double(value  arg1)
 {

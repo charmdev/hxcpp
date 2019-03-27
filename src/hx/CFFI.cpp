@@ -507,6 +507,18 @@ int * val_array_int(hx::Object * arg1)
    return (int *)a->GetBase();
 }
 
+short * val_array_short(hx::Object * arg1)
+{
+   #if (HXCPP_API_LEVEL>330)
+   hx::ArrayCommon *common = dynamic_cast< hx::ArrayCommon * >(arg1);
+   if (!common) return 0;
+   arg1 = common->__GetRealObject();
+   #endif
+   Array_obj<short> *a = dynamic_cast< Array_obj<short> * >(arg1);
+   if (a==0)
+      return 0;
+   return (short *)a->GetBase();
+}
 
 double * val_array_double(hx::Object * arg1)
 {
