@@ -33,7 +33,7 @@
   <cppflag value="-stdlib=libstdc++" if="FORCE_LIBGCC" />
   <cppflag value="-stdlib=libc++" if="HXCPP_CPP11" />
   <flag value="-g" if="HXCPP_DEBUG_LINK"/>
-  <flag value="-O2" unless="debug"/>
+  <flag value="-O1" unless="debug"/>
   <flag value="-arch"/>
   <flag value="armv6" if="HXCPP_ARMV6" />
   <flag value="armv7" if="HXCPP_ARMV7" />
@@ -43,7 +43,7 @@
   <flag value="${DEVELOPER_DIR}/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS${IPHONE_VER}.sdk"/>
   <!-- <flag value="-miphoneos-version-min=3.0" if="HXCPP_GCC" unless="HXCPP_ARMV7" />
   <flag value="-miphoneos-version-min=5.0" if="HXCPP_ARMV7" /> -->
-  <flag value="-miphoneos-version-min=5.0" unless="HXCPP_GCC" />
+  <flag value="-miphoneos-version-min=6.0" unless="HXCPP_GCC" />
   <flag value="-fobjc-arc" if="OBJC_ARC" />
   <flag value="-DOBJC_ARC" if="OBJC_ARC" />
   <flag value="-DENABLE_BITCODE=YES"/>
