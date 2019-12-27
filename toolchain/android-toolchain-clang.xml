@@ -61,6 +61,7 @@
   <flag value="-g" if="HXCPP_DEBUG_LINK"/>
   <flag value="-c"/>
   <flag value="-fpic"/>
+  <flag value="-O1" unless="debug"/>
   
   <!-- Warning Supression -->
   <flag value="-Wno-invalid-offsetof" />
@@ -71,7 +72,7 @@
 
 
 <linker id="dll" exe="clang++" >
-
+  <ext value=".so"/>
   <exe name="clang++" />
   <flag value ="-shared" />
   <flag value="--target=${EXEPREFIX}${PLATFORM_NUMBER}" />
