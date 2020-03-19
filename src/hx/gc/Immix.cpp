@@ -22,8 +22,6 @@ int gFastPath = 0;
 int gSlowPath = 0;
 
 
-
-
 }
 
 using hx::gByteMarkID;
@@ -103,7 +101,8 @@ int gInAlloc = false;
 static size_t sWorkingMemorySize          = 10*1024*1024;
 
 #ifdef HXCPP_GC_MOVING
-static size_t sgMaximumFreeSpace  = 200*1024*1024;
+// Just not sure what this shold be
+static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 #else
 static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 #endif
@@ -125,7 +124,7 @@ static size_t sgMaximumFreeSpace  = 1024*1024*1024;
   #endif
 #endif
 
-//define SHOW_FRAGMENTATION_BLOCKS
+// #define SHOW_FRAGMENTATION_BLOCKS
 #if defined SHOW_FRAGMENTATION_BLOCKS
   #define SHOW_FRAGMENTATION
 #endif
@@ -139,8 +138,31 @@ static size_t sgMaximumFreeSpace  = 1024*1024*1024;
 //#define PROFILE_THREAD_USAGE
 //#define HX_GC_VERIFY
 //#define SHOW_MEM_EVENTS
+//#define SHOW_MEM_EVENTS_VERBOSE
 //#define SHOW_FRAGMENTATION
-//
+
+//#define HX_GC_FIXED_BLOCKS
+//#define HX_WATCH
+
+#ifdef HX_WATCH
+void *hxWatchList[] = {
+  (void *)0x0000000100000200,
+  (void *)0
+};
+bool hxInWatchList(void *watch)
+{
+   for(void **t = hxWatchList; *t; t++)
+      if (*t==watch)
+         return true;
+   return false;
+}
+#endif
+
+#ifdef HX_GC_FIXED_BLOCKS
+#ifdef HX_WINDOWS
+#include <Memoryapi.h>
+#endif
+#endif
 
 #ifdef PROFILE_COLLECT
    #define HXCPP_GC_SUMMARY
@@ -216,6 +238,9 @@ static hx::Object *gCollectTrace = 0;
 static bool gCollectTraceDoPrint = false;
 static int gCollectTraceCount = 0;
 static int sgSpamCollects = 0;
+#endif
+
+#if defined(HXCPP_DEBUG) || defined(HXCPP_GC_DEBUG_ALWAYS_MOVE)
 static int sgAllocsSinceLastSpam = 0;
 #endif
 
@@ -365,13 +390,11 @@ static void VisitLocalAlloc(LocalAllocator *inAlloc,hx::VisitContext *__inCtx);
 static void WaitForSafe(LocalAllocator *inAlloc);
 static void ReleaseFromSafe(LocalAllocator *inAlloc);
 static void ClearPooledAlloc(LocalAllocator *inAlloc);
-static void CollectFromThisThread(bool inMajor);
+static void CollectFromThisThread(bool inMajor,bool inForceCompact);
 
 namespace hx
 {
 int gPauseForCollect = 0x00000000;
-
-bool gMultiThreadMode = false;
 
 StackContext *gMainThreadContext = 0;
 
@@ -620,6 +643,7 @@ struct BlockDataStats
       emptyBlocks += inOther.emptyBlocks;
       fraggedBlocks += inOther.fraggedBlocks;
       fragScore += inOther.fragScore;
+      fraggedRows += inOther.fraggedRows;
    }
 
    int rowsInUse;
@@ -627,6 +651,7 @@ struct BlockDataStats
    int emptyBlocks;
    int fragScore;
    int fraggedBlocks;
+   int fraggedRows;
 };
 
 static BlockDataStats sThreadBlockDataStats[MAX_MARK_THREADS];
@@ -700,6 +725,7 @@ struct BlockDataInfo
    int          mMaxHoleSize;
    int          mMoveScore;
    int          mUsedBytes;
+   int          mFraggedRows;
    bool         mPinned;
    unsigned char mZeroed;
    bool         mReclaimed;
@@ -738,7 +764,7 @@ struct BlockDataInfo
       mPtr     = inData;
       inData->mId = mId;
       #ifdef SHOW_MEM_EVENTS
-      GCLOG("  create block %d : %p -> %p\n",  mId, this, mPtr );
+      //GCLOG("  create block %d : %p -> %p\n",  mId, this, mPtr );
       #endif
       clear();
    }
@@ -747,6 +773,7 @@ struct BlockDataInfo
    {
       mUsedRows = 0;
       mUsedBytes = 0;
+      mFraggedRows = 0;
       mPinned = false;
       ZERO_MEM(allocStart,sizeof(int)*IMMIX_LINES);
       ZERO_MEM(mPtr->mRowMarked+IMMIX_HEADER_LINES, IMMIX_USEFUL_LINES); 
@@ -765,6 +792,7 @@ struct BlockDataInfo
    {
       mUsedRows = IMMIX_USEFUL_LINES;
       mUsedBytes = mUsedRows<<IMMIX_LINE_BITS;
+      mFraggedRows = 0;
       memset(mPtr->mRowMarked+IMMIX_HEADER_LINES, 1,IMMIX_USEFUL_LINES); 
       mRanges[0].start = 0;
       mRanges[0].length = 0;
@@ -825,7 +853,7 @@ struct BlockDataInfo
 
    void destroy()
    {
-      #ifdef SHOW_MEM_EVENTS
+      #ifdef SHOW_MEM_EVENTS_VERBOSE
       GCLOG("  release block %d : %p\n",  mId, this );
       #endif
       (*gBlockInfo)[mId] = 0;
@@ -840,6 +868,7 @@ struct BlockDataInfo
    {
       outStats.rowsInUse += mUsedRows;
       outStats.bytesInUse += mUsedBytes;
+      outStats.fraggedRows += mFraggedRows;
       //outStats.bytesInUse += 0;
       outStats.fragScore += mPinned ? (mMoveScore>0?1:0) : mMoveScore;
 
@@ -903,6 +932,8 @@ struct BlockDataInfo
       mOwned = false;
       outStats.rowsInUse += mUsedRows;
       outStats.bytesInUse += mUsedBytes;
+      outStats.fraggedRows += mFraggedRows;
+      mFraggedRows = 0;
       mHoles = 0;
 
       if (mUsedRows==IMMIX_LINES)
@@ -916,7 +947,9 @@ struct BlockDataInfo
          mReclaimed = false;
       }
 
-      mMaxHoleSize = (IMMIX_LINES - mUsedRows) << IMMIX_LINE_BITS;
+      int left = (IMMIX_LINES - mUsedRows) << IMMIX_LINE_BITS;
+      if (left<mMaxHoleSize)
+         mMaxHoleSize = left;
    }
 
    template<bool FULL>
@@ -1069,12 +1102,15 @@ struct BlockDataInfo
          outStats->rowsInUse += mUsedRows;
          outStats->bytesInUse += mUsedBytes;
          outStats->fragScore += mMoveScore;
+         outStats->fraggedRows += mFraggedRows;
 
          if (mUsedRows==0)
             outStats->emptyBlocks++;
          if (mMoveScore> FRAG_THRESH )
             outStats->fraggedBlocks++;
       }
+
+      mFraggedRows = 0;
    }
 
    int calcFragScore()
@@ -1108,100 +1144,46 @@ struct BlockDataInfo
       return allocString;
    }
 
-
-   AllocType GetAllocType(int inOffset)
+   #ifdef HXCPP_GC_NURSERY
+   AllocType GetEnclosingNurseryType(int inOffset, void **outPtr)
    {
-      int r = inOffset >> IMMIX_LINE_BITS;
-      if (r < IMMIX_HEADER_LINES || r >= IMMIX_LINES)
-      {
-         return allocNone;
-      }
-
-      if ( !( allocStart[r] & hx::gImmixStartFlag[inOffset &127]) )
-      {
-         #ifdef HXCPP_GC_NURSERY
-         // Find enclosing hole...
-         for(int h=0;h<mHoles;h++)
-         {
-            int scan = mRanges[h].start;
-            if (inOffset<scan)
-               break;
-            int size = 0;
-            int last = scan + mRanges[h].length;
-            if (inOffset<last)
-            {
-               while(scan<=inOffset)
-               {
-                  unsigned int header = *(unsigned int *)(mPtr->mRow[0]+scan);
-                  if (!(header & 0xff000000))
-                     size = header & 0x0000ffff;
-                  else
-                     size = (header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT;
-
-                  if (!size || scan+size > last)
-                     return allocNone;
-
-                  if (inOffset==scan)
-                  {
-                     if (header & IMMIX_ALLOC_IS_CONTAINER)
-                     {
-                        // See if object::new has been called, but not constructed yet ...
-                        void **vtable = (void **)(mPtr->mRow[0] + scan + sizeof(int));
-                        if (vtable[0]==0)
-                        {
-                           // GCLOG("Partially constructed object.");
-                           return allocString;
-                        }
-                        return allocObject;
-                     }
-                     return allocString;
-                  }
-                  scan += size + 4;
-               }
-               break;
-            }
-         }
-         #endif
-         // Not a actual start...
-         return allocNone;
-      }
-
-      return GetAllocTypeChecked(inOffset);
-   }
-
-   inline AllocType GetEnclosingNurseryAllocType(int blockOffset,void *&ioPtr)
-   {
-      #ifdef HXCPP_GC_NURSERY
-      // Find enclosing hole...
+      // For the nursery(generational) case, the allocStart markers are not set
+      // So trace tne new object links through the new allocation holes
       for(int h=0;h<mHoles;h++)
       {
          int scan = mRanges[h].start;
-         if (blockOffset<scan)
+         if (inOffset<scan)
             break;
 
          int size = 0;
          int last = scan + mRanges[h].length;
-         if (blockOffset<last)
+         if (inOffset<last)
          {
-            while(scan<=blockOffset)
+            // Found hole that the object was possibly allocated in
+            while(scan<=inOffset)
             {
+               // Trace along the hole...
                unsigned int header = *(unsigned int *)(mPtr->mRow[0]+scan);
                if (!(header & 0xff000000))
                   size = header & 0x0000ffff;
                else
                   size = (header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT;
 
-               if (!size || scan+size > last)
+               int end = scan+size+sizeof(int);
+               if (!size || end > last)
                   return allocNone;
 
-               // blockOffset is between scan and scan + size, and not too far from scan
-               if (size+scan>blockOffset && blockOffset-scan<=sgCheckInternalOffset+sizeof(int))
+               if (inOffset>=scan && inOffset<end)
                {
-                  ioPtr = (void *)(mPtr->mRow[0] + scan + sizeof(int));
+                  if (inOffset>scan+sgCheckInternalOffset)
+                     return allocNone;
+
+                  *outPtr = mPtr->mRow[0] + scan + sizeof(int);
+
                   if (header & IMMIX_ALLOC_IS_CONTAINER)
                   {
                      // See if object::new has been called, but not constructed yet ...
-                     void **vtable = (void **)ioPtr;
+                     void **vtable = (void **)(mPtr->mRow[0] + scan + sizeof(int));
                      if (vtable[0]==0)
                      {
                         // GCLOG("Partially constructed object.");
@@ -1211,90 +1193,70 @@ struct BlockDataInfo
                   }
                   return allocString;
                }
-               scan += size + 4;
+               scan = end;
             }
             break;
          }
       }
-      #endif
       return allocNone;
+}
+   #endif
+
+   AllocType GetAllocType(int inOffset)
+   {
+      // Row that the header would be on
+      int r = inOffset >> IMMIX_LINE_BITS;
+
+      // Out of bounds - can't be a new object start
+      if (r < IMMIX_HEADER_LINES || r >= IMMIX_LINES)
+      {
+         return allocNone;
+      }
+
+      // Does a live object start on this row
+      if ( !( allocStart[r] & hx::gImmixStartFlag[inOffset &127]) )
+      {
+         #ifdef HXCPP_GC_NURSERY
+         void *ptr;
+         return GetEnclosingNurseryType(inOffset,&ptr);
+         #endif
+         //Not a actual start...
+         return allocNone;
+      }
+
+      return GetAllocTypeChecked(inOffset);
    }
 
-   AllocType GetEnclosingAllocType(int blockOffset,void *&ioPtr)
+   AllocType GetEnclosingAllocType(int inOffset,void **outPtr)
    {
-      int r = blockOffset >> IMMIX_LINE_BITS;
-      if (r < IMMIX_HEADER_LINES || r >= IMMIX_LINES)
-         return allocNone;
-
-      // Normal, good alloc
-      int rowPos = hx::gImmixStartFlag[blockOffset &127];
-      if ( allocStart[r] & rowPos )
-         return GetAllocTypeChecked(blockOffset);
-
-      int offset = blockOffset;
-      // Go along row, looking for previous start ..
-      while(true)
+      for(int dx=0;dx<=sgCheckInternalOffset;dx+=4)
       {
-         offset -= 4;
-         if (offset<blockOffset-sgCheckInternalOffset)
-            return GetEnclosingNurseryAllocType(blockOffset, ioPtr);
-
-         rowPos >>= 1;
-         // Not on this row
-         if (!rowPos)
-            break;
-         if ( allocStart[r] & rowPos )
+         int blockOffset = inOffset - dx;
+         int r = blockOffset >> IMMIX_LINE_BITS;
+         if (r >= IMMIX_HEADER_LINES && r < IMMIX_LINES)
          {
-            // Found best object ...
-            AllocType result = GetAllocTypeChecked(offset);
-            if (result!=allocNone)
+            // Normal, good alloc
+            int rowPos = hx::gImmixStartFlag[blockOffset &127];
+            if ( allocStart[r] & rowPos )
             {
-               unsigned int header =  *(unsigned int *)((char *)mPtr + offset);
-               // See if it fits...
-               int size = ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
-               if (size>= blockOffset-offset)
-               {
-                  ioPtr = (char *)mPtr + offset + sizeof(int);
-                  return result;
-               }
+               // Found last valid object - is it big enough?
+               unsigned int header =  *(unsigned int *)((char *)mPtr + blockOffset);
+               int size = (header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT;
+               // Valid object not big enough...
+               if (blockOffset + size +sizeof(int) <= inOffset )
+                  break;
+
+               *outPtr = (void *)(mPtr->mRow[0] + blockOffset + sizeof(int));
+               return GetAllocTypeChecked(blockOffset);
             }
-            return allocNone;
          }
       }
 
-      // Not found on row, look on previsous rows...
-      int stop = std::max(r-sgCheckInternalOffsetRows,IMMIX_HEADER_LINES);
-      for(int row=r-1; row>=stop; row--)
-      {
-         int s = allocStart[row];
-         if (s)
-         {
-            for(int bit=31; bit>=0; bit--)
-               if (s & (1<<bit) )
-               {
-                  int offset = (row<<IMMIX_LINE_BITS) + (bit<<2);
-                  int delta =  blockOffset-offset;
-                  if (delta<-sgCheckInternalOffset)
-                     return GetEnclosingNurseryAllocType(blockOffset, ioPtr);
-                  AllocType result = GetAllocTypeChecked(offset);
-                  if (result!=allocNone)
-                  {
-                     unsigned int header =  *(unsigned int *)((char *)mPtr + offset);
-                     int size = ((header & IMMIX_ALLOC_SIZE_MASK) >> IMMIX_ALLOC_SIZE_SHIFT);
-                     if (size>= delta)
-                     {
-                        ioPtr = (char *)mPtr + offset + sizeof(int);
-                        return result;
-                     }
-                  }
-                  // Found closest, but no good
-                  return GetEnclosingNurseryAllocType(blockOffset, ioPtr);
-               }
-         }
-      }
-
-      // No start in range ...
-      return GetEnclosingNurseryAllocType(blockOffset, ioPtr);
+      #ifdef HXCPP_GC_NURSERY
+      return GetEnclosingNurseryType(inOffset,outPtr);
+      #endif
+      // Not a actual start...
+      return allocNone;
    }
 
 
@@ -1376,6 +1338,10 @@ bool MostUsedFirst(BlockDataInfo *inA, BlockDataInfo *inB)
    return inA->getUsedRows() > inB->getUsedRows();
 }
 
+//bool BiggestFreeFirst(BlockDataInfo *inA, BlockDataInfo *inB)
+//{
+//   return inA->mMaxHoleSize > inB->mMaxHoleSize;
+//}
 
 bool LeastUsedFirst(BlockDataInfo *inA, BlockDataInfo *inB)
 {
@@ -1993,9 +1959,10 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
       }
       #endif
 
-      if (flags)
+      int size = flags & 0xffff;
+      // Size will be 0 for large allocs -> no need to mark block
+      if (size)
       {
-         int size = flags & 0xffff;
          int start = (int)(ptr_i & IMMIX_BLOCK_OFFSET_MASK);
          int startRow = start>>IMMIX_LINE_BITS;
          int blockId = *(BlockIdType *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
@@ -2978,8 +2945,37 @@ void HxFreeGCBlock(void *p)
 
 #else
 
+#ifdef HX_GC_FIXED_BLOCKS
+unsigned char *chunkData = 0;
+void *HxAllocGCBlock(size_t inSize)
+{
+   if (!chunkData)
+   {
+      size_t size = 65536;
+      size *= IMMIX_BLOCK_SIZE;
+      #if defined(HX_WINDOWS) && defined(HXCPP_M64)
+      chunkData = (unsigned char *)0x100000000;
+      VirtualAlloc(chunkData,size,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+      #else
+      chunkData = (unsigned char *)HxAlloc(size);
+      size_t ptr_i = (size_t)(chunkData+0xffff) & ~((size_t)0xffff);
+      chunkData = (unsigned char *)ptr_i;
+      #endif
+      //printf("Using fixed blocks %p...%p\n", chunkData, chunkData+size);
+   }
+   void *result = chunkData;
+   //printf(" %p\n", result);
+   chunkData += inSize;
+   return result;
+}
+void HxFreeGCBlock(void *p)
+{
+   printf("todo - HX_GC_FIXED_BLOCKS %p\n",p);
+}
+#else
 void *HxAllocGCBlock(size_t size) { return HxAlloc(size); }
 void HxFreeGCBlock(void *p) { HxFree(p); }
+#endif
 
 #endif
 
@@ -3111,7 +3107,7 @@ public:
          #ifdef SHOW_MEM_EVENTS
          //GCLOG("Large alloc causing collection");
          #endif
-         CollectFromThisThread(false);
+         CollectFromThisThread(false,false);
       }
 
       inSize = (inSize +3) & ~3;
@@ -3120,7 +3116,11 @@ public:
          mLargeAllocSpace = inSize<<1;
 
       unsigned int *result = 0;
-      bool do_lock = hx::gMultiThreadMode;
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      bool do_lock = true;
+      #else
+      bool do_lock = false;
+      #endif
       bool isLocked = false;
 
 
@@ -3146,6 +3146,7 @@ public:
 
       if (!result)
          result = (unsigned int *)HxAlloc(inSize + sizeof(int)*2);
+
       if (!result)
       {
          #ifdef SHOW_MEM_EVENTS
@@ -3158,8 +3159,14 @@ public:
             isLocked = false;
          }
 
-         CollectFromThisThread(true);
+         CollectFromThisThread(true,true);
          result = (unsigned int *)HxAlloc(inSize + sizeof(int)*2);
+      }
+
+      if (!result)
+      {
+         GCLOG("Memory Exhausted!\n");
+         DebuggerTrap();
       }
 
       if (inClear)
@@ -3196,7 +3203,7 @@ public:
          if (inDelta>0 && (inDelta+mLargeAllocated > mLargeAllocForceRefresh) && sgInternalEnable)
          {
             //GCLOG("onMemoryChange alloc causing collection");
-            CollectFromThisThread(false);
+            CollectFromThisThread(false,false);
          }
 
          int rounded = (inDelta +3) & ~3;
@@ -3205,7 +3212,12 @@ public:
             mLargeAllocSpace = rounded<<1;
       }
 
-      bool do_lock = hx::gMultiThreadMode;
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      bool do_lock = true;
+      #else
+      bool do_lock = false;
+      #endif
+
       if (do_lock)
          mLargeListLock.Lock();
 
@@ -3301,7 +3313,7 @@ public:
          if (sgTimeToNextTableUpdate>1)
          {
             #ifdef SHOW_FRAGMENTATION
-              #ifdef SHOW_MEM_EVENTS
+              #ifdef SHOW_MEM_EVENTS_VERBOSE
                 GCLOG("  alloc -> enable full collect\n");
               #endif
             #endif
@@ -3354,7 +3366,7 @@ public:
       char *chunk = (char *)HxAllocGCBlock( 1<<(IMMIX_BLOCK_GROUP_BITS + IMMIX_BLOCK_BITS) );
       if (!chunk)
       {
-         DebuggerTrap();
+         //DebuggerTrap();
          #ifdef SHOW_MEM_EVENTS
          GCLOG("Alloc failed - try collect\n");
          #endif
@@ -3384,7 +3396,7 @@ public:
       VerifyBlockOrder();
       #endif
 
-      #if defined(SHOW_MEM_EVENTS) || defined(SHOW_FRAGMENTATION_BLOCKS)
+      #if defined(SHOW_MEM_EVENTS_VERBOSE) || defined(SHOW_FRAGMENTATION_BLOCKS)
       if (inJustBorrowing)
       {
          GCLOG("Borrow Blocks %d = %d k\n", mAllBlocks.size(), (mAllBlocks.size() << IMMIX_BLOCK_BITS)>>10);
@@ -3427,26 +3439,25 @@ public:
             continue;
          }
 
-         if (hx::gMultiThreadMode)
-         {
-            hx::EnterGCFreeZone();
-            gThreadStateChangeLock->Lock();
-            hx::ExitGCFreeZoneLocked();
+         #ifndef HXCPP_SINGLE_THREADED_APP
+         hx::EnterGCFreeZone();
+         gThreadStateChangeLock->Lock();
+         hx::ExitGCFreeZoneLocked();
 
-            result = GetNextFree(inRequiredBytes);
-         }
+         result = GetNextFree(inRequiredBytes);
+         #endif
 
          bool forceCompact = false;
          if (!result && allowMoreBlocks() && (!sgInternalEnable || GetWorkingMemory()<sWorkingMemorySize))
          {
-            AllocMoreBlocks(forceCompact,false);
-            result = GetNextFree(inRequiredBytes);
+            if (AllocMoreBlocks(forceCompact,false))
+               result = GetNextFree(inRequiredBytes);
          }
 
          if (!result)
          {
             inAlloc->SetupStack();
-            Collect(false,forceCompact,true);
+            Collect(false,forceCompact,true,true);
             result = GetNextFree(inRequiredBytes);
          }
 
@@ -3455,21 +3466,35 @@ public:
             // Try with compact this time...
             forceCompact = true;
             inAlloc->SetupStack();
-            Collect(false,forceCompact,true);
+            Collect(false,forceCompact,true,true);
             result = GetNextFree(inRequiredBytes);
          }
 
          if (!result)
          {
-            AllocMoreBlocks(forceCompact,false);
-            result = GetNextFree(inRequiredBytes);
+            if (AllocMoreBlocks(forceCompact,false))
+               result = GetNextFree(inRequiredBytes);
+         }
+
+         if (!result)
+         {
+            GCLOG("Memory exhausted.\n");
+            #ifndef HXCPP_M64
+            GCLOG(" try 64 bit build.\n");
+            #endif
+            #ifndef HXCPP_GC_BIG_BLOCKS
+            GCLOG(" try HXCPP_GC_BIG_BLOCKS.\n");
+            #endif
+            DebuggerTrap();
          }
 
          // Assume all wil be used
          mCurrentRowsInUse += result->GetFreeRows();
 
-         if (hx::gMultiThreadMode)
-            gThreadStateChangeLock->Unlock();
+         #ifndef HXCPP_SINGLE_THREADED_APP
+         gThreadStateChangeLock->Unlock();
+         #endif
+
 
          result->zeroAndUnlock();
 
@@ -3481,6 +3506,12 @@ public:
 
   void MoveSpecial(hx::Object *inTo, hx::Object *inFrom, int size)
    {
+      #ifdef HX_WATCH
+      if (hxInWatchList(inFrom))
+         GCLOG("****** watch MOVE from %p\n",inFrom);
+      if (hxInWatchList(inTo))
+         GCLOG("****** watch MOVE to %p\n",inTo);
+      #endif
        // FinalizerList will get visited...
 
        hx::FinalizerMap::iterator i = hx::sFinalizerMap.find(inFrom);
@@ -3901,7 +3932,7 @@ public:
          {
             size_t groupBytes = g.blocks << (IMMIX_BLOCK_BITS);
 
-            #ifdef SHOW_MEM_EVENTS
+            #ifdef SHOW_MEM_EVENTS_VERBOSE
             GCLOG("Release group %d: %p -> %p\n", i, g.alloc, g.alloc+groupBytes);
             #endif
             #ifdef HX_GC_VERIFY
@@ -4499,12 +4530,18 @@ public:
          hx::gMarkIDWithContainer = (gByteMarkID << 24) | IMMIX_ALLOC_IS_CONTAINER;
          gRememberedByteMarkID = gByteMarkID | HX_GC_REMEMBERED;
 
+         #ifdef HX_WATCH
+         GCLOG(" non-gen mark byte -> %02x\n", hx::gByteMarkID);
+         #endif
          gBlockStack = 0;
 
          ClearRowMarks();
       }
       else
       {
+         #ifdef HX_WATCH
+         GCLOG(" non-gen mark byte -> %02x\n", hx::gByteMarkID);
+         #endif
          ClearBlockMarks();
       }
 
@@ -4592,6 +4629,14 @@ public:
       for(int i=0;i<mAllBlocks.size();i++)
          mAllBlocks[i]->verify("After mark");
       #endif
+
+      #ifdef HX_WATCH
+      for(void **watch = hxWatchList; *watch; watch++)
+      {
+         GCLOG("********* Watch mark : %p %08x\n",*watch, ((unsigned int *)*watch)[-1]);
+         GCLOG(" ******** is marked  : %d\n", (((unsigned char *)(*watch))[HX_ENDIAN_MARK_ID_BYTE]== gByteMarkID));
+      }
+      #endif
    }
 
 
@@ -4610,9 +4655,11 @@ public:
    }
    #endif
 
-   void Collect(bool inMajor, bool inForceCompact, bool inLocked=false)
+   void Collect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false)
    {
       PROFILE_COLLECT_SUMMARY_START;
+
+      #ifndef HXCPP_SINGLE_THREADED_APP
       // If we set the flag from 0 -> 0xffffffff then we are the collector
       //  otherwise, someone else is collecting at the moment - so wait...
       if (!HxAtomicExchangeIf(0, 0xffffffff,(volatile int *)&hx::gPauseForCollect))
@@ -4633,22 +4680,22 @@ public:
          }
          return;
       }
+      #endif
 
       STAMP(t0)
 
       // We are the collector - all must wait for us
       LocalAllocator *this_local = 0;
-      if (hx::gMultiThreadMode)
-      {
-         this_local = (LocalAllocator *)(hx::ImmixAllocator *)hx::tlsStackContext;
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      this_local = (LocalAllocator *)(hx::ImmixAllocator *)hx::tlsStackContext;
 
-         if (!inLocked)
-            gThreadStateChangeLock->Lock();
+      if (!inLocked)
+         gThreadStateChangeLock->Lock();
 
-         for(int i=0;i<mLocalAllocs.size();i++)
-            if (mLocalAllocs[i]!=this_local)
-               WaitForSafe(mLocalAllocs[i]);
-      }
+      for(int i=0;i<mLocalAllocs.size();i++)
+         if (mLocalAllocs[i]!=this_local)
+            WaitForSafe(mLocalAllocs[i]);
+      #endif
 
       sgIsCollecting = true;
 
@@ -4678,12 +4725,17 @@ public:
       __hxt_gc_start();
       #endif
 
+      size_t freeFraggedRows = 0; 
+      if (inFreeIsFragged)
+      {
+         for(int i=mNextFreeBlock; i<mFreeBlocks.size(); i++)
+            freeFraggedRows += mFreeBlocks[i]->GetFreeRows();
+      }
 
       // Now all threads have mTopOfStack & mBottomOfStack set.
       bool generational = false; 
 
       #ifdef HXCPP_GC_GENERATIONAL
-      // TODO - Maybe do full collect if too many dirty
       bool compactSurviors = false;
 
       if (sGcMode==gcmGenerational)
@@ -4719,10 +4771,16 @@ public:
       #if defined(HX_GC_VERIFY) && defined(HXCPP_GC_GENERATIONAL)
       if (generational)
       {
+         #ifdef SHOW_MEM_EVENTS
+         GCLOG("verify generational [\n");
+         #endif
          sGcVerifyGenerational = true;
          sgTimeToNextTableUpdate--;
          MarkAll(false);
          sGcVerifyGenerational = false;
+         #ifdef SHOW_MEM_EVENTS
+         GCLOG("] verify generational\n");
+         #endif
       }
       #endif
 
@@ -4749,19 +4807,22 @@ public:
       if (!full && generational)
       {
          countRows(stats);
-
-         double filled = (double)stats.rowsInUse / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
+         size_t currentRows = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
+         double filled = (double)(currentRows) / (double)(mAllBlocks.size()*IMMIX_USEFUL_LINES);
          if (filled>0.85)
          {
             // Failure of generational estimation
-            int retained = stats.rowsInUse - mRowsInUse;
+            int retained = currentRows - mRowsInUse;
             int space = mAllBlocks.size()*IMMIX_USEFUL_LINES - mRowsInUse;
             if (space<retained)
                space = retained;
+            if (space<1)
+               space = 1;
             mGenerationalRetainEstimate = (double)retained/(double)space;
             #ifdef SHOW_MEM_EVENTS
-            GCLOG("Generational retention too high %f, do normal collect\n", mGenerationalRetainEstimate);
+            GCLOG("Generational retention/fragmentation too high %f, do normal collect\n", mGenerationalRetainEstimate);
             #endif
+
 
             generational = false;
             MarkAll(generational);
@@ -4790,7 +4851,7 @@ public:
       #ifdef HXCPP_GC_MOVING
       if (!full)
       {
-         double useRatio = (double)(stats.rowsInUse<<IMMIX_LINE_BITS) / (sWorkingMemorySize);
+         double useRatio = (double)(mRowsInUse<<IMMIX_LINE_BITS) / (sWorkingMemorySize);
          #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
             GCLOG("Row use ratio:%f\n", useRatio);
          #endif
@@ -4808,21 +4869,26 @@ public:
       #endif
 
       if (full)
+      {
+         #ifdef HXCPP_GC_MOVING
+         sgTimeToNextTableUpdate = 7;
+         #else
          sgTimeToNextTableUpdate = 15;
+         #endif
+      }
 
       size_t oldRowsInUse = mRowsInUse;
-      mRowsInUse = stats.rowsInUse;
+      mRowsInUse = stats.rowsInUse + stats.fraggedRows + freeFraggedRows;
 
       bool moved = false;
-      size_t bytesInUse = stats.bytesInUse;
 
       #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
       GCLOG("Total memory : %s\n", formatBytes(GetWorkingMemory()).c_str());
-      GCLOG("  reserved bytes : %s\n", formatBytes((size_t)mRowsInUse*IMMIX_LINE_LEN).c_str());
+      GCLOG("  reserved bytes : %s\n", formatBytes(mRowsInUse*IMMIX_LINE_LEN).c_str());
       if (full)
       {
-         GCLOG("  active bytes   : %s\n", formatBytes(bytesInUse).c_str());
-         GCLOG("  active ratio   : %f\n", (double)bytesInUse/( mRowsInUse*IMMIX_LINE_LEN));
+         GCLOG("  active bytes   : %s\n", formatBytes(stats.bytesInUse).c_str());
+         GCLOG("  active ratio   : %f\n", (double)stats.bytesInUse/( mRowsInUse*IMMIX_LINE_LEN));
          GCLOG("  fragged blocks : %d (%.1f%%)\n", stats.fraggedBlocks, stats.fraggedBlocks*100.0/mAllBlocks.size() );
          GCLOG("  fragged score  : %f\n", (double)stats.fragScore/mAllBlocks.size() );
       }
@@ -4830,6 +4896,7 @@ public:
       GCLOG("  empty blocks : %d (%.1f%%)\n", stats.emptyBlocks, stats.emptyBlocks*100.0/mAllBlocks.size());
       #endif
 
+      size_t bytesInUse = mRowsInUse<<IMMIX_LINE_BITS;
 
       STAMP(t3)
 
@@ -4850,7 +4917,8 @@ public:
 
       size_t recycleRemaining = 0;
       #ifdef RECYCLE_LARGE
-      recycleRemaining = mLargeAllocForceRefresh;
+      if (!inForceCompact)
+         recycleRemaining = mLargeAllocForceRefresh;
       #endif
 
       int idx = 0;
@@ -4895,7 +4963,7 @@ public:
             doRelease = true;
          else
          {
-            size_t mem = stats.rowsInUse<<IMMIX_LINE_BITS;
+            size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
             size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, mem/100 * (size_t)hx::sgTargetFreeSpacePercentage );
             targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
             sWorkingMemorySize = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory);
@@ -4916,8 +4984,11 @@ public:
          }
 
 
-         if (doRelease || stats.fragScore > mAllBlocks.size()*FRAG_THRESH || hx::gAlwaysMove)
+         bool isFragged = stats.fragScore > mAllBlocks.size()*FRAG_THRESH;
+         if (doRelease || isFragged || hx::gAlwaysMove)
          {
+            if (isFragged && sgTimeToNextTableUpdate>3)
+               sgTimeToNextTableUpdate = 3;
             calcMoveOrder( );
 
             // Borrow some blocks to ensuure space to defrag into
@@ -4942,7 +5013,7 @@ public:
             {
                if (doRelease)
                {
-                  size_t mem = stats.rowsInUse<<IMMIX_LINE_BITS;
+                  size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
                   size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, bytesInUse/100 *hx::sgTargetFreeSpacePercentage );
                   targetFree = std::min(targetFree, (size_t)sgMaximumFreeSpace );
                   size_t targetMem = std::max( mem + targetFree, (size_t)hx::sgMinimumWorkingMemory) +
@@ -4970,7 +5041,7 @@ public:
                #if defined(SHOW_FRAGMENTATION) || defined(SHOW_MEM_EVENTS)
                GCLOG("After compacting---\n");
                GCLOG("  total memory : %s\n", formatBytes(GetWorkingMemory()).c_str() );
-               GCLOG("  total needed : %s\n", formatBytes((size_t)stats.rowsInUse*IMMIX_LINE_LEN).c_str() );
+               GCLOG("  total needed : %s\n", formatBytes((size_t)mRowsInUse*IMMIX_LINE_LEN).c_str() );
                GCLOG("  for bytes    : %s\n", formatBytes(bytesInUse).c_str() );
                GCLOG("  empty blocks : %d (%.1f%%)\n", stats.emptyBlocks, stats.emptyBlocks*100.0/mAllBlocks.size());
                GCLOG("  fragged blocks : %d (%.1f%%)\n", stats.fraggedBlocks, stats.fraggedBlocks*100.0/mAllBlocks.size() );
@@ -4989,7 +5060,7 @@ public:
 
       STAMP(t5)
 
-      size_t mem = stats.rowsInUse<<IMMIX_LINE_BITS;
+      size_t mem = mRowsInUse<<IMMIX_LINE_BITS;
       size_t baseMem = full ? bytesInUse : mem;
       #ifdef HXCPP_GC_DYNAMIC_SIZE
       size_t targetFree = std::max((size_t)hx::sgMinimumFreeSpace, (size_t)(baseMem * profileCollectSummary.spaceFactor ) );
@@ -5027,11 +5098,12 @@ public:
       else
       {
          // move towards 0.2
-         mGenerationalRetainEstimate += (0.2-mGenerationalRetainEstimate)*0.025;
+         mGenerationalRetainEstimate += (0.2-mGenerationalRetainEstimate)*0.25;
       }
 
       double filled_ratio = (double)mRowsInUse/(double)(mAllBlocksCount*IMMIX_USEFUL_LINES);
       double after_gen = filled_ratio + (1.0-filled_ratio)*mGenerationalRetainEstimate;
+
       if (after_gen<0.75)
       {
          sGcMode = gcmGenerational;
@@ -5039,11 +5111,12 @@ public:
       else
       {
          sGcMode = gcmFull;
-         gByteMarkID |= 0x30;
+         // What was I thinking here?  This breaks #851
+         //gByteMarkID |= 0x30;
       }
 
       #ifdef SHOW_MEM_EVENTS
-      GCLOG("filled=%.2f%% + junk = %.2f%% = %.2f%% -> %s\n",
+      GCLOG("filled=%.2f%% + estimate = %.2f%% = %.2f%% -> %s\n",
             filled_ratio*100, mGenerationalRetainEstimate*100, after_gen*100, sGcMode==gcmFull?"Full":"Generational");
       #endif
 
@@ -5121,8 +5194,7 @@ public:
 
 
       hx::gPauseForCollect = 0x00000000;
-      if (hx::gMultiThreadMode)
-      {
+      #ifndef HXCPP_SINGLE_THREADED_APP
          for(int i=0;i<mLocalAllocs.size();i++)
          {
             #ifdef HXCPP_SCRIPTABLE
@@ -5134,13 +5206,11 @@ public:
 
          if (!inLocked)
             gThreadStateChangeLock->Unlock();
-      }
-      else
-      {
+      #else
         #ifdef HXCPP_SCRIPTABLE
         hx::gMainThreadContext->byteMarkId = hx::gByteMarkID;
         #endif
-      }
+      #endif
 
 
       PROFILE_COLLECT_SUMMARY_END;
@@ -5357,7 +5427,7 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
    #endif
 
    #ifdef SHOW_MEM_EVENTS
-   GCLOG("Mark conservative %p...%p (%d)\n", inBottom, inTop, (int)(inTop-inBottom) );
+   GCLOG("Mark conservative %p...%p (%d) [...", inBottom, inTop, (int)(inTop-inBottom) );
    #endif
 
    #ifdef HXCPP_STACK_UP
@@ -5374,16 +5444,33 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
 
    void *prev = 0;
    void *lastPin = 0;
+   #ifdef HX_WATCH
+   void *lastWatch = 0;
+   bool isWatch = false;
+   #endif
    for(int *ptr = inBottom ; ptr<inTop; ptr++)
    {
       void *vptr = *(void **)ptr;
+
       MemType mem;
       if (vptr && !((size_t)vptr & 0x03) && vptr!=prev && vptr!=lastPin)
       {
+
          #ifdef PROFILE_COLLECT
          hx::localCount++;
          #endif
          MemType mem = sGlobalAlloc->GetMemType(vptr);
+
+         #ifdef HX_WATCH
+         isWatch = false;
+         if (hxInWatchList(vptr) && vptr!=lastWatch)
+         {
+            isWatch = true;
+            lastWatch = vptr;
+            GCLOG("********* Watch location conservative mark %p:%d\n",vptr,mem);
+         }
+         #endif
+
          if (mem!=memUnmanaged)
          {
             if (mem==memLarge)
@@ -5399,26 +5486,51 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
 
                int pos = (int)(((size_t)vptr) & IMMIX_BLOCK_OFFSET_MASK);
                AllocType t = sgCheckInternalOffset ?
-                     info->GetEnclosingAllocType(pos-sizeof(int),vptr):
+                     info->GetEnclosingAllocType(pos-sizeof(int),&vptr):
                      info->GetAllocType(pos-sizeof(int));
                if ( t==allocObject )
                {
-                  //GCLOG(" Mark object %p (%p)\n", vptr,ptr);
+                  #ifdef HX_WATCH
+                  if (isWatch)
+                  {
+                     GCLOG(" Mark object %p (%p)\n", vptr,ptr);
+                  }
+                  #endif
                   HX_MARK_OBJECT( ((hx::Object *)vptr) );
                   lastPin = vptr;
                   info->pin();
                }
                else if (t==allocString)
                {
-                  // GCLOG(" Mark string %p (%p)\n", vptr,ptr);
+                  #ifdef HX_WATCH
+                  if (isWatch)
+                     GCLOG(" Mark string %p (%p)\n", vptr,ptr);
+                  #endif
                   HX_MARK_STRING(vptr);
                   lastPin = vptr;
                   info->pin();
                }
                else if (t==allocMarked)
                {
+                  #ifdef HX_WATCH
+                  if (isWatch)
+                     GCLOG(" pin alloced %p (%p)\n", vptr,ptr);
+                  #endif
                   lastPin = vptr;
                   info->pin();
+               }
+               else
+               {
+                  #ifdef HX_WATCH
+                  if (isWatch)
+                  {
+                     GCLOG(" missed watch %p:%d\n", vptr,t);
+
+                     int x = info->GetAllocType(pos-sizeof(int));
+                     int y = info->GetEnclosingAllocType(pos-sizeof(int),&vptr);
+                     printf("but got %d,%d o=%d\n",x,y,sgCheckInternalOffset);
+                  }
+                  #endif
                }
             }
          }
@@ -5426,6 +5538,9 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
          // sGlobalAlloc->GetMemType(vptr) , memUnmanaged );
       }
    }
+   #ifdef SHOW_MEM_EVENTS
+   GCLOG("...]\n");
+   #endif
 }
 
 } // namespace hx
@@ -5434,6 +5549,8 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
 // --- LocalAllocator -------------------------------------------------------
 //
 // One per thread ...
+
+static int sFragIgnore=0;
 
 class LocalAllocator : public hx::StackContext
 {
@@ -5448,7 +5565,9 @@ public:
    {
       mTopOfStack = mBottomOfStack = inTopOfStack;
       mRegisterBufSize = 0;
+      #ifndef HXCPP_SINGLE_THREADED_APP
       mGCFreeZone = false;
+      #endif
       mStackLocks = 0;
       mGlobalStackLock = 0;
       Reset();
@@ -5491,8 +5610,10 @@ public:
 
 
       // It is in the free zone - wait for 'SetTopOfStack' to activate
+      #ifndef HXCPP_SINGLE_THREADED_APP
       mGCFreeZone = true;
       mReadyForCollect.Set();
+      #endif
       sGlobalAlloc->AddLocal(this);
    }
 
@@ -5502,8 +5623,10 @@ public:
 
       onThreadDetach();
 
+      #ifndef HXCPP_SINGLE_THREADED_APP
       if (!mGCFreeZone)
          EnterGCFreeZone();
+      #endif
 
       AutoLock lock(*gThreadStateChangeLock);
 
@@ -5537,6 +5660,7 @@ public:
       allocBase = 0;
       mCurrentHole = 0;
       mCurrentHoles = 0;
+      mFraggedRows = &sFragIgnore;
       #ifdef HXCPP_GC_NURSERY
       spaceFirst = 0;
       spaceOversize = 0;
@@ -5600,8 +5724,10 @@ public:
          else
             mGlobalStackLock = true;
 
+         #ifndef HXCPP_SINGLE_THREADED_APP
          if (mGCFreeZone)
             ExitGCFreeZone();
+         #endif
       }
       else
       {
@@ -5615,7 +5741,6 @@ public:
             Release();
          }
       }
-
 
       #ifdef VerifyStackRead
       VerifyStackRead(mBottomOfStack, mTopOfStack)
@@ -5668,8 +5793,10 @@ public:
       VerifyStackRead(mBottomOfStack, mTopOfStack)
       #endif
 
+      #ifndef HXCPP_SINGLE_THREADED_APP
       if (mGCFreeZone)
          ExitGCFreeZone();
+      #endif
 
       CAPTURE_REGS;
    }
@@ -5679,6 +5806,7 @@ public:
    {
       if (sgIsCollecting)
          CriticalGCError("Bad Allocation while collecting - from finalizer?");
+      #ifndef HXCPP_SINGLE_THREADED_APP
       volatile int dummy = 1;
       mBottomOfStack = (int *)&dummy;
       CAPTURE_REGS;
@@ -5688,10 +5816,12 @@ public:
 
       mReadyForCollect.Set();
       mCollectDone.Wait();
+      #endif
    }
 
    void EnterGCFreeZone()
    {
+      #ifndef HXCPP_SINGLE_THREADED_APP
       volatile int dummy = 1;
       mBottomOfStack = (int *)&dummy;
       mGCFreeZone = true;
@@ -5704,36 +5834,37 @@ public:
       #endif
 
       mReadyForCollect.Set();
+      #endif
    }
 
    bool TryGCFreeZone()
    {
+      #ifndef HXCPP_SINGLE_THREADED_APP
       if (mGCFreeZone)
          return false;
       EnterGCFreeZone();
+      #endif
       return true;
    }
 
    void ExitGCFreeZone()
    {
+      #ifndef HXCPP_SINGLE_THREADED_APP
       if (!mGCFreeZone)
          CriticalGCError("GCFree Zone mismatch");
 
-      if (hx::gMultiThreadMode)
-      {
-         AutoLock lock(*gThreadStateChangeLock);
-         mReadyForCollect.Reset();
-         mGCFreeZone = false;
-      }
+      AutoLock lock(*gThreadStateChangeLock);
+      mReadyForCollect.Reset();
+      mGCFreeZone = false;
+      #endif
    }
         // For when we already hold the lock
    void ExitGCFreeZoneLocked()
    {
-      if (hx::gMultiThreadMode)
-      {
-         mReadyForCollect.Reset();
-         mGCFreeZone = false;
-      }
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      mReadyForCollect.Reset();
+      mGCFreeZone = false;
+      #endif
    }
 
 
@@ -5743,6 +5874,7 @@ public:
    //  it has finished the collect.
    void WaitForSafe()
    {
+      #ifndef HXCPP_SINGLE_THREADED_APP
       if (!mGCFreeZone)
       {
          // Cause allocation routines for fail ...
@@ -5754,12 +5886,15 @@ public:
          #endif
          mReadyForCollect.Wait();
       }
+      #endif
    }
 
    void ReleaseFromSafe()
    {
+      #ifndef HXCPP_SINGLE_THREADED_APP
       if (!mGCFreeZone)
          mCollectDone.Set();
+      #endif
    }
 
    void ExpandAlloc(int &ioSize)
@@ -5788,12 +5923,14 @@ public:
 
    void *CallAlloc(int inSize,unsigned int inObjectFlags)
    {
-      #ifdef HXCPP_DEBUG
+      #ifndef HXCPP_SINGLE_THREADED_APP
+      #if HXCPP_DEBUG
       if (mGCFreeZone)
          CriticalGCError("Allocating from a GC-free thread");
       #endif
       if (hx::gPauseForCollect)
          PauseForCollect();
+      #endif
 
       #if defined(HXCPP_VISIT_ALLOCS) && defined(HXCPP_M64)
       // Make sure we can fit a relocation pointer
@@ -5832,6 +5969,7 @@ public:
 
                return buffer;
             }
+            *mFraggedRows += (spaceOversize - spaceFirst)>>IMMIX_LINE_BITS;
          #else
             int end = spaceStart + allocSize + skip4;
             if (end <= spaceEnd)
@@ -5858,8 +5996,11 @@ public:
 
                return buffer;
             }
+            *mFraggedRows += (spaceEnd - spaceStart)>>IMMIX_LINE_BITS;
          #endif
-         else if (mMoreHoles)
+
+
+         if (mMoreHoles)
          {
             #ifdef HXCPP_GC_NURSERY
             spaceFirst = allocBase + mCurrentRange[mCurrentHole].start + sizeof(int);
@@ -5889,6 +6030,7 @@ public:
             mCurrentRange = info->mRanges;
             allocStartFlags = info->allocStart;
             mCurrentHoles = info->mHoles;
+            mFraggedRows = &info->mFraggedRows;
             #ifdef HXCPP_GC_NURSERY
             spaceFirst = allocBase + mCurrentRange->start + sizeof(int);
             spaceOversize = spaceFirst + mCurrentRange->length;
@@ -5968,11 +6110,13 @@ public:
       #endif
 
       Reset();
+
    }
 
    int            mCurrentHole;
    int            mCurrentHoles;
    HoleRange     *mCurrentRange;
+   int           *mFraggedRows;
 
      bool           mMoreHoles;
 
@@ -5982,12 +6126,15 @@ public:
    hx::RegisterCaptureBuffer mRegisterBuf;
    int                   mRegisterBufSize;
 
+   #ifndef HXCPP_SINGLE_THREADED_APP
    bool            mGCFreeZone;
+   HxSemaphore     mReadyForCollect;
+   HxSemaphore     mCollectDone;
+   #endif
+
    int             mStackLocks;
    bool            mGlobalStackLock;
    int             mID;
-   HxSemaphore     mReadyForCollect;
-   HxSemaphore     mCollectDone;
 };
 
 
@@ -5996,22 +6143,14 @@ public:
 inline LocalAllocator *GetLocalAlloc(bool inAllowEmpty=false)
 {
    #ifndef HXCPP_SINGLE_THREADED_APP
-   if (hx::gMultiThreadMode)
-   {
-      #ifdef HXCPP_DEBUG
       LocalAllocator *result = (LocalAllocator *)(hx::ImmixAllocator *)hx::tlsStackContext;
       if (!result && !inAllowEmpty)
-      {
          hx::BadImmixAlloc();
-      }
-      return result;
-      #else
-      return (LocalAllocator *)(hx::ImmixAllocator *)hx::tlsStackContext;
-      #endif
-   }
-   #endif
 
-   return (LocalAllocator *)hx::gMainThreadContext;
+      return result;
+   #else
+      return (LocalAllocator *)hx::gMainThreadContext;
+   #endif
 }
 
 void WaitForSafe(LocalAllocator *inAlloc)
@@ -6043,11 +6182,11 @@ void VisitLocalAlloc(LocalAllocator *inAlloc,hx::VisitContext *__inCtx)
 
 
 
-void CollectFromThisThread(bool inMajor)
+void CollectFromThisThread(bool inMajor,bool inForceCompact)
 {
    LocalAllocator *la = GetLocalAlloc();
    la->SetupStack();
-   sGlobalAlloc->Collect(inMajor,false);
+   sGlobalAlloc->Collect(inMajor,inForceCompact);
 }
 
 namespace hx
@@ -6069,40 +6208,37 @@ void PauseForCollect()
 
 void EnterGCFreeZone()
 {
-   if (hx::gMultiThreadMode)
-   {
+   #ifndef HXCPP_SINGLE_THREADED_APP
       LocalAllocator *tla = GetLocalAlloc();
       tla->EnterGCFreeZone();
-   }
+   #endif
 }
 
 
 bool TryGCFreeZone()
 {
-   if (hx::gMultiThreadMode)
-   {
+   #ifndef HXCPP_SINGLE_THREADED_APP
       LocalAllocator *tla = GetLocalAlloc();
       return tla->TryGCFreeZone();
-   }
-   return false;
+   #else
+      return false;
+   #endif
 }
 
 void ExitGCFreeZone()
 {
-   if (hx::gMultiThreadMode)
-   {
+   #ifndef HXCPP_SINGLE_THREADED_APP
       LocalAllocator *tla = GetLocalAlloc();
       tla->ExitGCFreeZone();
-   }
+   #endif
 }
 
 void ExitGCFreeZoneLocked()
 {
-   if (hx::gMultiThreadMode)
-   {
+   #ifndef HXCPP_SINGLE_THREADED_APP
       LocalAllocator *tla = GetLocalAlloc();
       tla->ExitGCFreeZoneLocked();
-   }
+   #endif
 }
 
 void InitAlloc()
@@ -6134,8 +6270,9 @@ void InitAlloc()
 
 void GCPrepareMultiThreaded()
 {
-   if (!hx::gMultiThreadMode)
-      hx::gMultiThreadMode = true;
+   #ifdef HXCPP_SINGLE_THREADED_APP
+   CriticalGCError("GCPrepareMultiThreaded called with HXCPP_SINGLE_THREADED_APP");
+   #endif
 }
 
 
@@ -6178,7 +6315,7 @@ void *InternalNew(int inSize,bool inIsObject)
    if (sgSpamCollects && sgAllocsSinceLastSpam>=sgSpamCollects)
    {
       //GCLOG("InternalNew spam\n");
-      CollectFromThisThread(false);
+      CollectFromThisThread(false,false);
    }
    sgAllocsSinceLastSpam++;
    #endif
@@ -6268,7 +6405,7 @@ void *InternalRealloc(void *inData,int inSize, bool inExpand)
    if (sgSpamCollects && sgAllocsSinceLastSpam>=sgSpamCollects)
    {
       //GCLOG("InternalNew spam\n");
-      CollectFromThisThread(false);
+      CollectFromThisThread(false,false);
    }
    sgAllocsSinceLastSpam++;
    #endif
