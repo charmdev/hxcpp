@@ -78,7 +78,7 @@ class Setup
                   var revision = StringTools.trim(split[1]);
                   var split2 = revision.split( "." );
                   var result:Float = 1.0 * Std.parseInt(split2[0]) + 0.001 * Std.parseInt(split2[1]);
-                  if (result!=null && result>=8)
+                  if (result>=8)
                   {
                      Log.v('Deduced NDK version '+result+' from "$inDirName"/source.properties');
                      fin.close();
@@ -89,7 +89,7 @@ class Setup
          }
          catch (e:haxe.io.Eof)
          {
-            Log.warn('Could not deduce NDK version from "$inDirName"/source.properties');
+            Log.v('Could not deduce NDK version from "$inDirName"/source.properties');
          }
          fin.close();
       }
@@ -107,7 +107,7 @@ class Setup
          return result;
       }
 
-      Log.warn('Could not deduce NDK version from "$inDirName" - assuming 8');
+      Log.v('Could not deduce NDK version from "$inDirName" - assuming 8');
       return 8;
    }
 
@@ -278,7 +278,7 @@ class Setup
       }
       else if (inWhat=="msvc")
       {
-         setupMSVC(ioDefines, ioDefines.exists("HXCPP_M64"), ioDefines.exists("winrt"));
+         setupMSVC(ioDefines, ioDefines.exists("HXCPP_M64"), ioDefines.exists("HXCPP_ARM64"), ioDefines.exists("winrt"));
       }
       else if (inWhat=="pdbserver")
       {
@@ -420,7 +420,7 @@ class Setup
       catch(e:Dynamic) { }
 
       if(defines.exists('NDKV20+')) {
-         Log.info([
+         Log.v([
             "x86 Platform: 16",
             "arm Platform: 16",
             "x86_64 Platform: 21",
@@ -429,10 +429,10 @@ class Setup
          ].join('\n'));
       }
       else {
-         globallySetThePlatform(root, defines);  
+         globallySetThePlatform(root, defines);
       }
    }
-   
+
    private static function globallySetThePlatform(root:String, defines:Map<String,String>) {
       var androidPlatform = 5;
       if (!defines.exists("PLATFORM"))
@@ -447,7 +447,7 @@ class Setup
             }
          }
       }
-      
+
       if (defines.exists("PLATFORM"))
       {
          var platform = defines.get("PLATFORM");
@@ -564,7 +564,7 @@ class Setup
       }
    }
 
-   public static function setupMSVC(ioDefines:Hash<String>, in64:Bool, isWinRT:Bool)
+   public static function setupMSVC(ioDefines:Hash<String>, in64:Bool, inArm64, isWinRT:Bool)
    {
       var detectMsvc = !ioDefines.exists("NO_AUTO_MSVC") &&
                        !ioDefines.exists("HXCPP_MSVC_CUSTOM");
@@ -612,7 +612,9 @@ class Setup
         var extra:String = "";
         if (isWinRT)
             extra += "-winrt";
-        if (in64)
+        if (inArm64)
+            extra += "-arm64";
+        else if (in64)
             extra += "64";
          var xpCompat = false;
          if (ioDefines.exists("HXCPP_WINXP_COMPAT"))
@@ -620,6 +622,7 @@ class Setup
             Sys.putEnv("HXCPP_WINXP_COMPAT","1");
             xpCompat = true;
          }
+         Sys.putEnv("msvc_host_arch", ioDefines.exists("windows_arm_host") ? "x86" : "x64" );
 
          var vc_setup_proc = new Process("cmd.exe", ["/C", BuildTool.HXCPP + "\\toolchain\\msvc" + extra + "-setup.bat" ]);
          var vars_found = false;
@@ -659,6 +662,7 @@ class Setup
          } catch (e:Dynamic) {
          };
 
+         vc_setup_proc.exitCode();
          vc_setup_proc.close();
          if (!vars_found || error_string!="")
          {

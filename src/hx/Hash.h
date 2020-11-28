@@ -243,6 +243,8 @@ struct HashBase : public HashRoot
    virtual void set(KEY inKey, const Float &inValue) = 0;
    virtual void set(KEY inKey, const Dynamic &inValue) = 0;
 
+   virtual void clear() = 0;
+
    virtual HashBase<KEY> *convertStore(HashStore inStore) = 0;
 
    virtual bool remove(KEY inKey) = 0;
@@ -326,7 +328,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 #endif
       mask = inNewCount-1;
       //printf("expand %d -> %d\n",bucketCount, inNewCount);
-      bucket = (Element **)InternalRealloc(bucket,inNewCount*sizeof(ELEMENT *));
+      bucket = (Element **)InternalRealloc(bucketCount*sizeof(ELEMENT *), bucket,inNewCount*sizeof(ELEMENT *));
       HX_OBJ_WB_GET(this, bucket);
       //for(int b=bucketCount;b<inNewCount;b++)
       //   bucket[b] = 0;
@@ -367,6 +369,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    void compact()
    {
+      int origSize = bucketCount;
       int newSize = bucketCount>>1;
       // printf("compact -> %d\n", newSize);
       mask = newSize-1;
@@ -390,7 +393,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
          }
       }
       bucketCount = newSize;
-      bucket = (Element **)InternalRealloc(bucket, sizeof(ELEMENT *)*bucketCount );
+      bucket = (Element **)InternalRealloc(origSize*sizeof(ELEMENT *),bucket, sizeof(ELEMENT *)*bucketCount );
       HX_OBJ_WB_GET(this, bucket);
    }
 
@@ -561,6 +564,14 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    void set(Key inKey, const Float &inValue)  { TSet(inKey, inValue); }
    void set(Key inKey, const Dynamic &inValue)  { TSet(inKey, inValue); }
    void set(Key inKey, const null &inValue)  { TSet(inKey, inValue);  }
+
+   void clear()
+   {
+      bucket = 0;
+      size = 0;
+      mask = 0;
+      bucketCount = 0;
+   }
 
 
    template<typename F>
