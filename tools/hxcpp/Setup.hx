@@ -398,7 +398,10 @@ class Setup
       // See what ANDROID_HOST to use ...
       try
       {
-         var prebuilt =  root+"/toolchains/"+arm_type+"-" + defines.get("TOOLCHAIN_VERSION") + "/prebuilt";
+         // Per-architecture gcc toolchains were removed from the NDK in r23, only llvm is left
+         var prebuilt = root+"/toolchains/llvm/prebuilt";
+         if (!FileSystem.exists(prebuilt))
+            prebuilt = root+"/toolchains/"+arm_type+"-" + defines.get("TOOLCHAIN_VERSION") + "/prebuilt";
          var files = FileSystem.readDirectory(prebuilt);
          for (file in files)
          {
@@ -421,8 +424,8 @@ class Setup
 
       if(defines.exists('NDKV20+')) {
          Log.v([
-            "x86 Platform: 16",
-            "arm Platform: 16",
+            "x86 Platform: 21",
+            "arm Platform: 21",
             "x86_64 Platform: 21",
             "arm_64 Platform: 21",
             "Frameworks should set the minSdkVersion for each APK to these values."

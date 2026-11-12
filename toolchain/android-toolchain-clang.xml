@@ -3,7 +3,7 @@
 <!-- Set architecture -->
 <section if="HXCPP_X86">
   <set name="ARCH" value="-x86" />
-  <set name="PLATFORM_NUMBER" value="16" />
+  <set name="PLATFORM_NUMBER" value="21" />
   <set name="EXEPREFIX" value="i686-linux-android" />
 </section>
 
@@ -15,7 +15,7 @@
 
 <section if="HXCPP_ARMV7">
   <set name="ARCH" value="-v7" />
-  <set name="PLATFORM_NUMBER" value="16" />
+  <set name="PLATFORM_NUMBER" value="21" />
   <set name="EXEPREFIX" value="arm-linux-androideabi" />
 </section>
 
@@ -32,7 +32,10 @@
      
 <path name="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/${ANDROID_HOST}/bin" />
 
-<set name="HXCPP_AR" value="arm-linux-androideabi-ar" />
+<!-- binutils were removed from the NDK in r23: use the LLVM tools -->
+<set name="HXCPP_AR" value="llvm-ar" />
+<set name="HXCPP_RANLIB" value="llvm-ranlib" />
+<set name="HXCPP_STRIP" value="llvm-strip" />
 
 <include name="toolchain/gcc-toolchain.xml"/>
 
@@ -67,6 +70,8 @@
   <flag value="-c"/>
   <flag value="-fpic"/>
   <flag value="-O1" unless="debug"/>
+  <!-- clang defaults to C++17 since NDK r26, where the throw() specs used here are errors -->
+  <cppflag value="-std=c++14"/>
   
   <!-- Warning Supression -->
   <flag value="-Wno-invalid-offsetof" />
@@ -83,6 +88,9 @@
   <flag value="--target=${EXEPREFIX}${PLATFORM_NUMBER}" />
 
   <flag value ="-static-libstdc++" />
+  <!-- 16 KB page size support: required by Google Play for 64-bit libraries -->
+  <flag value ="-Wl,-z,max-page-size=16384" />
+  <flag value ="-Wl,-z,common-page-size=16384" />
   <flag value ="-v" />
   <prefix value="lib"/>
   <lib name="-llog"/>
